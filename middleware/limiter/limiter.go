@@ -1,9 +1,10 @@
+// inspired by golang/time/blob/master/rate/rate.go
+
 package limiter
 
 import (
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -28,20 +29,29 @@ func New(config ...Config) fiber.Handler {
 		// Limiter variables
 		mux        = &sync.RWMutex{}
 		max        = strconv.Itoa(cfg.Max)
-		timestamp  = uint64(time.Now().Unix())
 		expiration = uint64(cfg.Expiration.Seconds())
 	)
 
 	// Create manager to simplify storage operations ( see manager.go )
 	manager := newManager(cfg.Storage)
 
-	// Update timestamp every second
-	go func() {
-		for {
-			atomic.StoreUint64(&timestamp, uint64(time.Now().Unix()))
-			time.Sleep(1 * time.Second)
-		}
-	}()
+	durationFromTokens := func(tokens float64) time.Duration {
+		seconds := tokens / float64(cfg.Max)
+		return time.Nanosecond * time.Duration(1e9*seconds)
+	}
+
+	tokensFromDuration := func(d time.Duration) float64 {
+		sec := float64(d/time.Second) * float64(cfg.Max)
+		nsec := float64(d%time.Second) * float64(cfg.Max)
+		return sec + nsec/1e9
+	}
+
+	setHeaders := func(tokens float64, c *fiber.Ctx) *fiber.Ctx {
+		c.Set(xRateLimitLimit, max)
+		c.Set(xRateLimitRemaining, strconv.Itoa(int(tokens)))
+		c.Set(xRateLimitReset, strconv.FormatUint(uint64(expiration), 10))
+		return c
+	}
 
 	// Return new handler
 	return func(c *fiber.Ctx) error {
@@ -55,68 +65,54 @@ func New(config ...Config) fiber.Handler {
 
 		// Lock entry
 		mux.Lock()
+		defer mux.Unlock()
+
 		// Get entry from pool and release when finished
 		e := manager.get(key)
 
-		// Get timestamp
-		ts := atomic.LoadUint64(&timestamp)
-		// Set expiration if entry does not exist
-		if e.exp == 0 {
-			e.exp = ts + expiration
-
-		} else if ts >= e.exp {
-			// Check if entry is expired
-			e.prevHits = e.currHits
-			e.currHits = 0
-
-			// checks how into the current window it is and sets the
-			// expiry based on that, otherwise this would only reset on
-			// the next request and not show the correct expiry
-			elapsed := ts - e.exp
-			if elapsed >= expiration {
-				e.exp = ts + expiration
-			} else {
-				e.exp = ts + expiration - elapsed
-			}
+		// If first time seen key or last entry had expired and was garbage collected
+		if e.last.Equal(time.Time{}) && e.tokens == 0 {
+			e.tokens = float64(cfg.Max) - 1
+			e.last = time.Now()
+			manager.set(key, e, cfg.Expiration)
+			return setHeaders(e.tokens, c).Next()
 		}
 
-		// Increment hits
-		e.currHits++
+		now := time.Now()
+		last := e.last
+		if now.Before(last) {
+			last = now
+		}
 
-		// Calculate when it resets in seconds
-		expire := e.exp - ts
+		maxElapsed := durationFromTokens(float64(cfg.Max) - e.tokens)
+		elapsed := now.Sub(last)
+		if elapsed > maxElapsed {
+			elapsed = maxElapsed
+		}
 
-		// weight = time elapsed in current window / total window length
-		weight := float64(expiration-expire) / float64(expiration)
+		// new bucket amount = gained tokens - token used for this request
+		tokens := e.tokens + tokensFromDuration(elapsed) - 1
+		if tokens > float64(cfg.Max) {
+			tokens = float64(cfg.Max)
+		}
 
-		// rate = request count in previous window - weight + request count in current window
-		rate := int(float64(e.prevHits)*weight) + e.currHits
+		// Update storage. Garbage collect after 1 window
+		e.last = now
+		e.tokens = tokens
+		manager.set(key, e, cfg.Expiration)
 
-		// Calculate how many hits can be made based on the current rate
-		remaining := cfg.Max - rate
-
-		// Update storage. Garbage collect after 2 windows
-		manager.set(key, e, cfg.Expiration*2)
-
-		// Unlock entry
-		mux.Unlock()
-
-		// Check if hits exceed the cfg.Max
-		if remaining < 0 {
+		// Check if no tokens remaining
+		if tokens < 0 {
+			retryAfter := durationFromTokens(-tokens)
 			// Return response with Retry-After header
 			// https://tools.ietf.org/html/rfc6584
-			c.Set(fiber.HeaderRetryAfter, strconv.FormatUint(expire, 10))
-
+			c.Set(fiber.HeaderRetryAfter, strconv.FormatUint(uint64(retryAfter), 10))
+			c.Set(xRateLimitLimit, max)
 			// Call LimitReached handler
 			return cfg.LimitReached(c)
 		}
 
-		// We can continue, update RateLimit headers
-		c.Set(xRateLimitLimit, max)
-		c.Set(xRateLimitRemaining, strconv.Itoa(int(remaining)))
-		c.Set(xRateLimitReset, strconv.FormatUint(expire, 10))
-
-		// Continue stack
-		return c.Next()
+		// We can continue, update RateLimit headers and continue stack
+		return setHeaders(tokens, c).Next()
 	}
 }

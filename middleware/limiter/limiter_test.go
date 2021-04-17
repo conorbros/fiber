@@ -148,6 +148,7 @@ func Test_Limiter_Next(t *testing.T) {
 	utils.AssertEqual(t, fiber.StatusNotFound, resp.StatusCode)
 }
 
+//go test -run Test_Limiter_Headers
 func Test_Limiter_Headers(t *testing.T) {
 	app := fiber.New()
 
@@ -230,42 +231,32 @@ func Test_Limiter_Cheat(t *testing.T) {
 		}
 	}
 
-	t1 := time.Now()
-	singleRequest(nil, false)           // one request to start our window
-	time.Sleep(1000 * time.Millisecond) // Wait to make sure we are well into the current window
-
 	// Send requests
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go singleRequest(&wg, false)
 	}
 
 	wg.Wait()
-
-	// wait until the current window is finished and we are into the next window
-	t2 := t1.Add(time.Millisecond * 3250).Sub(time.Now())
-	time.Sleep(t2)
 
 	// Send more requests
 	for i := 0; i < 6; i++ {
+		singleRequest(nil, true)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go singleRequest(&wg, false)
 	}
-	wg.Wait()
-
-	// these should fail
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go singleRequest(&wg, true)
-	}
 
 	wg.Wait()
 
-	time.Sleep(4 * time.Second) // wait 2 windows to ensure our rate has
 	// Verify that we are able to send requests again
 	for i := 0; i < 9; i++ {
 		wg.Add(1)
-		go singleRequest(&wg, false)
+		go singleRequest(&wg, true)
 	}
 	wg.Wait()
 }
@@ -274,8 +265,8 @@ func Test_Limiter_Cheat(t *testing.T) {
 func Test_Sliding_Window(t *testing.T) {
 	app := fiber.New()
 	app.Use(New(Config{
-		Max:        10,
-		Expiration: 2 * time.Second,
+		Max:        3,
+		Expiration: 3 * time.Second,
 		Storage:    memory.New(),
 	}))
 
@@ -298,25 +289,23 @@ func Test_Sliding_Window(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < 5; i++ {
-		singleRequest(nil, false)
-	}
-
-	time.Sleep(2 * time.Second)
-
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 3; i++ {
 		singleRequest(nil, false)
 	}
 
 	time.Sleep(3 * time.Second)
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 3; i++ {
 		singleRequest(nil, false)
 	}
 
-	time.Sleep(4 * time.Second)
+	for i := 0; i < 3; i++ {
+		singleRequest(nil, true)
+	}
 
-	for i := 0; i < 9; i++ {
+	time.Sleep(3 * time.Second)
+
+	for i := 0; i < 3; i++ {
 		singleRequest(nil, false)
 	}
 }

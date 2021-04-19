@@ -3,6 +3,7 @@
 package limiter
 
 import (
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -96,9 +97,22 @@ func New(config ...Config) fiber.Handler {
 			tokens = float64(cfg.Max)
 		}
 
-		// Update storage. Garbage collect after 1 window
-		e.last = now
-		e.tokens = tokens
+		// Calculate when it resets in seconds
+		expire := e.exp - ts
+
+		elapsed := ts - (e.exp - expiration)
+		revoked := int(float64(cfg.Max) / float64(expiration) * float64(elapsed))
+
+		if e.hits -= revoked; e.hits < 0 {
+			e.hits = 0
+		}
+
+		// Set how many hits we have left
+		remaining := cfg.Max - e.hits
+
+		fmt.Printf("%v %v %v\n\n", e.hits, revoked, ts)
+
+		// Update storage
 		manager.set(key, e, cfg.Expiration)
 
 		// Check if no tokens remaining
